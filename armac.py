@@ -63,110 +63,84 @@ class ReservoirBuffer(object):
   def __iter__(self):
     return iter(self._data)
 
-class CReLU(nn.Module):
-  def __init__(self):
-    super(CReLU, self).__init__()
+def state_to_matrix(state, device):
+  t = T.tensor(state).to(device)
+  if t.ndim == 1:
+    return t.unsqueeze(0)
+  else:
+    return t
 
-  def forward(self, x):
-    x = T.cat((x,-x), 1)
-    return F.relu(x)
+def action_to_matrix(action, device):
+  t = T.LongTensor(action).to(device)
+  if t.ndim == 1:
+    return t.unsqueeze(0)
+  else:
+    return t
 
-class AccumulativeRegrets(nn.Module):
-  def __init__(self, information_state_size, num_actions, hidden=128):
-    super(AccumulativeRegrets, self).__init__()
-    self.l1 = nn.Linear(information_state_size, hidden)
-    self.l2 = nn.Linear(hidden*6, num_actions)
-    self.crelu1 = CReLU()
-    self.crelu2 = CReLU()
-    self.relu = nn.ReLU()
+class ArmacNeuralNetwork(nn.Module):
+  def __init__(self, information_state_size, num_distinct_actions, observation_generalization_size, hidden):
+    super(ArmacNeuralNetwork, self).__init__()
+    self.observation1 = nn.Linear(information_state_size, observation_generalization_size)
+    self.observation2 = nn.Linear(information_state_size, observation_generalization_size)
+    self.l1 = nn.Linear(observation_generalization_size * 2, hidden)
+    self.l2s = [nn.Linear(observation_generalization_size, hidden) for _ in range(2)]
+    self.l3s = [nn.Linear(hidden, num_distinct_actions) for _ in range(3)]
+    self.dummy = nn.Parameter(T.empty(0))
 
-    self.dummy_param = nn.Parameter(T.empty(0)) # to get current device
+  def get_history_values(self, full_history_state, legal_actions):
+    state1 = state_to_matrix(full_history_state[0], self.dummy.device)
+    state2 = state_to_matrix(full_history_state[1], self.dummy.device)
+    legal_actions = action_to_matrix(legal_actions, self.dummy.device)
+    temp = T.cat([self.observation1(state1), self.observation2(state2)], 1)
+    temp = self.l3s[0](F.sigmoid(self.l1(temp)))
+    return T.gather(temp, 1, legal_actions)
 
-  def forward(self, state, legal_actions):
-    h1 = self.l1(state)
-    h2 = T.cat([self.crelu1(h1), h1], 1)
-    h3 = self.crelu2(h2)
-    h4 = self.l2(h3)
-    legal_actions = T.cat(h4.size()[0] * [T.LongTensor(legal_actions).unsqueeze(0)])
-    legal_actions = legal_actions.to(self.dummy_param.device)
-    return T.gather(self.relu(h4), 1, legal_actions)
+  def get_single_history_value(self, full_history_state, legal_actions, action):
+    action = [legal_actions.index(action)]
+    action = action_to_matrix(action, self.dummy.device)
+    return T.gather(self.get_history_values(full_history_state, legal_actions), 1, action)
 
-  def get_distribution_without_grad(self, state, legal_actions):
+  def get_max_history_value(self, full_history_state, legal_actions):
+    return self.get_history_values(full_history_state, legal_actions).max(dim=1, keepdims=True).values
+
+  def get_accumulative_regrets(self, state, legal_actions):
+    state = state_to_matrix(state, self.dummy.device)
+    legal_actions = action_to_matrix(legal_actions, self.dummy.device)
+    temp = self.l3s[1](F.sigmoid(self.l2s[0](F.sigmoid(self.observation1(state)))))
+    return T.gather(temp, 1, legal_actions)
+
+  def get_average_strategy(self, state, legal_actions):
+    state = state_to_matrix(state, self.dummy.device)
+    legal_actions = action_to_matrix(legal_actions, self.dummy.device)
+    temp = F.relu(self.l3s[2](F.sigmoid(self.l2s[1](F.sigmoid(self.observation1(state))))))
+    temp = T.gather(temp, 1, legal_actions)
+    if temp.sum() == .0:
+      return T.ones(temp.size()) / len(legal_actions)
+    else:
+      return temp / temp.sum(1, keepdims=True)
+
+  def get_history_values_without_grad(self, full_history_state, legal_actions):
     with T.no_grad():
-      q_values = self.forward(T.FloatTensor(state).unsqueeze(0).to(self.dummy_param.device), legal_actions).cpu()
-      if q_values.sum() == .0:
-        return np.ones(len(legal_actions)) / len(legal_actions)
+      return self.get_history_values(full_history_state, legal_actions)
+
+  def get_strategy_without_grad(self, state, legal_actions):
+    with T.no_grad():
+      temp = F.relu(self.get_accumulative_regrets(state, legal_actions)).to('cpu')
+      if temp.sum() == .0:
+        return T.ones(temp.size()) / len(legal_actions)
       else:
-        return (q_values / q_values.sum()).squeeze().numpy()
+        return temp / temp.sum(1, keepdims=True)
 
-class HistoryValue(nn.Module):
-  def __init__(self, history_size, num_actions, embedding_size, hidden=128):
-    super(HistoryValue, self).__init__()
-    self.l1 = nn.Linear(history_size+embedding_size, hidden)
-    self.l2 = nn.Linear(hidden*6, 1)
-    self.embedding = nn.Embedding(num_actions, embedding_size)
-    self.crelu1 = CReLU()
-    self.crelu2 = CReLU()
-
-    self.dummy_param = nn.Parameter(T.empty(0)) # to get current device
-
-  def forward(self, state, action):
-    input = T.cat([state, self.embedding(action)], dim=1)
-    h1 = self.l1(input)
-    h2 = T.cat([self.crelu1(h1), h1], 1)
-    h3 = self.crelu2(h2)
-    h4 = self.l2(h3)
-    return h4
-
-  def get_max_value_without_grad(self, state, legal_actions):
-    return self.get_values_without_grad(state, legal_actions).max()
-
-  def get_value_without_grad(self, state, action):
-    state = T.unsqueeze(T.FloatTensor([state]).to(self.dummy_param.device), 0)
+  def get_average_strategy_without_grad(self, state, legal_actions):
     with T.no_grad():
-      return self.forward(state, action).cpu().item()
-
-  def get_values_without_grad(self, state, legal_actions : list):
-    states = T.cat(len(legal_actions) * [T.FloatTensor(state).unsqueeze(0)]).to(self.dummy_param.device)
-    with T.no_grad():
-      return self.forward(states, T.LongTensor(legal_actions).to(self.dummy_param.device)).squeeze().cpu().numpy()
-
-class AverageStrategy(nn.Module):
-  def __init__(self, information_state_size, num_actions, hidden=128):
-    super(AverageStrategy, self).__init__()
-    self.l1 = nn.Linear(information_state_size, hidden)
-    self.l2 = nn.Linear(hidden*6, num_actions)
-    self.crelu1 = CReLU()
-    self.crelu2 = CReLU()
-    self.relu = nn.ReLU()
-    self.softmax = nn.Softmax(dim=1) # difference from class AccumulativeRegrets
-
-    self.dummy_param = nn.Parameter(T.empty(0)) # to get current device
-
-  def forward(self, state, legal_actions):
-    h1 = self.l1(state)
-    h2 = T.cat([self.crelu1(h1), h1], 1)
-    h3 = self.crelu2(h2)
-    h4 = self.l2(h3)
-    legal_actions = T.cat(h4.size()[0] * [T.LongTensor(legal_actions).unsqueeze(0)])
-    legal_actions = legal_actions.to(self.dummy_param.device)
-    return T.gather(self.softmax(self.relu(h4)), 1, legal_actions)
-
-  def get_distribution_without_grad(self, state, legal_actions):
-    with T.no_grad():
-      q_values = self.forward(T.FloatTensor(state).unsqueeze(0).to(self.dummy_param.device), legal_actions).cpu()
-      if q_values.sum() == .0:
-        return np.ones(len(legal_actions)) / len(legal_actions)
-      else:
-        return (q_values / q_values.sum()).squeeze().numpy()
+      return self.get_average_strategy(state, legal_actions).to('cpu')
 
 #TRJ = collections.namedtuple('Record', 'history state action legal_actions player_seat regrets retrospective_policy')
 TRJ = collections.namedtuple('Record', 'history state action legal_actions current_player regrets retrospective_policy')
 class Trajectory:
-  def __init__(self, player_seat, rival_param_index, reward=None, capacity=100):
+  def __init__(self, player_seat, reward=None, capacity=100):
     #self.player = player
     self.player_seat = player_seat
-    self.rival_param_index = rival_param_index
     self.reward = reward
     self.buffer = []
 
@@ -178,16 +152,13 @@ class Trajectory:
     return iter(self.buffer)
 
   def __str__(self):
-    return f'Trajectory : player {self.player_seat} rival_param_index {self.rival_param_index} reward {self.reward} length {len(self.buffer)}'
+    return f'Trajectory : player {self.player_seat} reward {self.reward} length {len(self.buffer)}'
 
 class ArmacSolver(policy.Policy):
   def __init__(self,
                game,
                device: str = 'cuda' if T.cuda.is_available() else 'cpu',
                num_learning: int = 64,
-               lr_history_value: float = 1e-3,
-               lr_accumulative_regrets: float = 1e-3,
-               lr_average_strategy: float = 1e-3,
                learning_rate: float = 1e-4,
                batch_size: int = 1024,
                memory_capacity: int = int(1e6),
@@ -204,27 +175,20 @@ class ArmacSolver(policy.Policy):
     self._num_players = game.num_players()
     # This class will first focus on two-player zero-sum poker games
     assert(self._num_players == 2)
-    self._learning_rate = learning_rate
     self._batch_size = batch_size
     self._memory_capacity = memory_capacity
 
-    self._retrospective_params = []
-    self._history_value = HistoryValue(self._history_size, self._num_actions, 5).to(device)
-    self._past_history_value = HistoryValue(self._history_size, self._num_actions, 5).to(device)
-    self._accumulative_regrets = AccumulativeRegrets(self._feature_size, self._num_actions).to(device)
-    self._past_accumulative_regrets = AccumulativeRegrets(self._feature_size, self._num_actions).to(device)
-    self._average_strategy = AverageStrategy(self._feature_size, self._num_actions).to(device)
+    self._retrospective_networks = []
     self._epoch_buffer = ReservoirBuffer(memory_capacity)
-    self._optimizer_accumulative_regrets = O.Adam(self._accumulative_regrets.parameters(), lr=lr_accumulative_regrets)
-    self._optimizer_history_value = O.Adam(self._history_value.parameters(), lr=lr_history_value)
-    self._optimizer_average_strategy = O.Adam(self._average_strategy.parameters(), lr=lr_average_strategy)
+    self._network = ArmacNeuralNetwork(self._feature_size, self._num_actions, 240, 120)
+    self._past_network = None
+    self._optimizer = O.Adam(self._network.parameters(), lr=learning_rate)
 
     self._loss_MSE = nn.MSELoss().to(device)
     self._loss_div = nn.KLDivLoss().to(device)
 
     if reset_parameters:
-      for network in [self._history_value, self._accumulative_regrets, self._past_history_value, self._past_accumulative_regrets, self._average_strategy]:
-        self.__class__.reset_parameters(network)
+        self.__class__.reset_parameters(self._network)
 
     self._player_seat = 1
     self._counter = 0
@@ -234,34 +198,19 @@ class ArmacSolver(policy.Policy):
     for par in network.state_dict().values():
       par.fill_(.0)
 
-  @staticmethod
-  def full_history_state(state):
-    return state.information_state_tensor(0)[:8] + state.information_state_tensor(1)
-
-#  def _load_past_accumulative_regrets(self, param_index):
-#    if param_index >= len(self._retrospective_params):
-#      self._past_accumulative_regrets.load_state_dict(deepcopy(self._accumulative_regrets.state_dict()))
-#    else:
-#      self._past_accumulative_regrets.load_state_dict(deepcopy(self._retrospective_params[param_index]))
-
-  def _load_past_parameters(self, param_index):
-    if param_index >= len(self._retrospective_params):
-      self._past_accumulative_regrets.load_state_dict(deepcopy(self._accumulative_regrets.state_dict()))
-      self._past_history_value.load_state_dict(deepcopy(self._history_value.state_dict()))
+  def _load_past_network(self):
+    if len(self._retrospective_networks) == 0:
+      self._past_network = self._network
     else:
-      self._past_accumulative_regrets.load_state_dict(self._retrospective_params[param_index][0])
-      self._past_history_value.load_state_dict(self._retrospective_params[param_index][1])
+      self._past_network = self._retrospective_networks[rn.randint(0, len(self._retrospective_networks))]
 
   def solve(self, num_iterations, num_traversals):
     for _ in range(num_iterations):
       self._epoch_buffer.clear()
       for _ in range(num_traversals):
         self._player_seat = (self._player_seat + 1) % self._num_players
-        retrospective_param_len = len(self._retrospective_params)
-        param_index = rn.randint(0, retrospective_param_len) if retrospective_param_len > 0 else 0
-        trajectory_buffer = Trajectory(self._player_seat, param_index, capacity=num_traversals)
-#        self._load_past_accumulative_regrets(param_index)
-        self._load_past_parameters(param_index)
+        trajectory_buffer = Trajectory(self._player_seat, capacity=num_traversals)
+        self._load_past_network()
         terminal_state = self._traverse_game_tree(self._root_node,
                                                   self._player_seat,
                                                   trajectory_buffer)
@@ -272,51 +221,47 @@ class ArmacSolver(policy.Policy):
       for _ in range(self._num_learning):
         self._learning()
 
-      self._retrospective_params.append([deepcopy(self._accumulative_regrets.state_dict()), deepcopy(self._history_value.state_dict())])
+      self._retrospective_networks.append(deepcopy(self._network).to('cpu'))
 
   def _learning(self):
     batch_trajectories = self._epoch_buffer.sample(self._batch_size)
     for trajectory in batch_trajectories:
-      reward = T.FloatTensor([trajectory.reward]).to(self._device)
+      reward = T.FloatTensor([trajectory.reward]).to(self._device).unsqueeze(0)
       player_seat = trajectory.player_seat
       for idx in range(len(trajectory.buffer)):
         record = trajectory.buffer[idx]
         next_record = trajectory.buffer[idx+1]  if (idx+1) < len(trajectory.buffer) else None
 
-        history = T.FloatTensor(record.history).unsqueeze(0).to(self._device)
-        state = T.FloatTensor(record.state).unsqueeze(0).to(self._device)
+        full_history = record.history
+        state = record.state
         next_state = next_record.state if next_record else None
-        next_history = next_record.history if next_record else None
-        action = T.LongTensor(record.action).to(self._device)
+        next_full_history = next_record.history if next_record else None
+        action = record.action
         legal_actions = record.legal_actions
         next_legal_actions = next_record.legal_actions if next_record else None
         current_player = record.current_player
         retrospective_policy = T.FloatTensor(record.retrospective_policy).to(self._device)
 
-        # train critic
-        self._optimizer_history_value.zero_grad()
+        self._optimizer.zero_grad()
+        # history state value loss for all
         if next_state:
-          l1 = self._loss_MSE(self._history_value(history, action), T.FloatTensor([self._history_value.get_max_value_without_grad(next_history, next_legal_actions)]).unsqueeze(0).to(self._device))
+          l1 = self._loss_MSE(self._network.get_single_history_value(full_history, legal_actions, action),
+                              self._network.get_max_history_value(next_full_history, next_legal_actions))
         else:
-          l1 = self._loss_MSE(self._history_value(history, action), reward.unsqueeze(0))
-        l1.backward()
-        self._optimizer_history_value.step()
+          l1 = self._loss_MSE(self._network.get_single_history_value(full_history, legal_actions, action),
+                              reward)
 
-        # train accumulative regret
+        # accumulative regrets loss for player i
         if current_player == player_seat:
           regrets = T.FloatTensor(record.regrets).to(self._device)
-          self._optimizer_accumulative_regrets.zero_grad()
-          l2 = self._loss_MSE(self._accumulative_regrets(state, legal_actions), regrets.unsqueeze(0))
+          l2 = self._loss_MSE(self._network.get_accumulative_regrets(state, legal_actions), regrets) + l1
           l2.backward()
-          self._optimizer_accumulative_regrets.step()
-
-        # train average actor
+          self._optimizer.step()
+        # average policy loss for player j
         else:
-          assert(record.regrets is None) # just for test
-          self._optimizer_average_strategy.zero_grad()
-          l3 = self._loss_div(self._average_strategy(state, legal_actions), retrospective_policy)
+          l3 = self._loss_div(self._network.get_average_strategy(state, legal_actions), retrospective_policy) + l1
           l3.backward()
-          self._optimizer_average_strategy.step()
+          self._optimizer.step()
 
   def _traverse_game_tree(self, state, player_seat, buffer):
     if state.is_terminal():
@@ -328,27 +273,27 @@ class ArmacSolver(policy.Policy):
 
     else:
       # sample action to traverse game tree for both players
-      actor_network = self._accumulative_regrets if state.current_player() == 0 else self._past_accumulative_regrets
+      actor_network = self._network if self._player_seat == state.current_player() else self._past_network
       information_state = state.information_state_tensor(state.current_player()) # not a torch tensor
       legal_actions = state.legal_actions()
-      strategy = actor_network.get_distribution_without_grad(information_state, legal_actions)
-      action = rn.choice(legal_actions, 1, p=strategy)
-      full_history_state = self.__class__.full_history_state(state)
-
-      past_strategy = self._past_accumulative_regrets.get_distribution_without_grad(information_state, legal_actions)
+      strategy = actor_network.get_strategy_without_grad(information_state, legal_actions)
+      probabilities = np.array(strategy).squeeze()
+      action = rn.choice(legal_actions, 1, p=probabilities)
+      past_strategy = self._past_network.get_strategy_without_grad(information_state, legal_actions)
+      full_history_state = [state.information_state_tensor(0), state.information_state_tensor(1)]
       if state.current_player() == player_seat:
-        past_history_values = self._past_history_value.get_values_without_grad(full_history_state, legal_actions)
-        regrets = past_history_values - (past_strategy * past_history_values).sum()
+        past_history_values = self._past_network.get_history_values_without_grad(full_history_state, legal_actions)
+        regrets = past_history_values - (past_strategy * past_history_values).sum(1, keepdims=True)
         buffer.add(full_history_state, information_state, action, legal_actions, state.current_player(), regrets, past_strategy)
       else:
         buffer.add(full_history_state, information_state, action, legal_actions, state.current_player(), None, past_strategy)
-        pass
 
       return self._traverse_game_tree(state.child(action), player_seat, buffer)
 
   def action_probabilities(self, state, player_id=None):
     legal_actions = state.legal_actions()
-    probabilities = self._average_strategy.get_distribution_without_grad(state.information_state_tensor(state.current_player()), legal_actions)
+    strategy = self._network.get_average_strategy_without_grad(state.information_state_tensor(state.current_player()), legal_actions)
+    probabilities = np.array(strategy).squeeze()
     return {legal_actions[i]: probabilities[i] for i in range(len(legal_actions))}
 
 
@@ -358,8 +303,8 @@ def main():
   rn.seed(1234)
   G = pyspiel.load_game('leduc_poker')
   armac = ArmacSolver(G,
-                  num_learning=3,
-                  batch_size=8)
+                  num_learning=50,
+                  batch_size=32)
   f = open('armac_result.txt', 'wt')
   # for testing
 #  iterations = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
@@ -367,7 +312,7 @@ def main():
 
   with tqdm(total=iterations[-1]) as pbar:
     for iteration_ in iterations:
-      armac.solve(num_iterations=(iteration_ - current), num_traversals = 16)
+      armac.solve(num_iterations=(iteration_ - current), num_traversals = 64)
       conv = pyspiel.nash_conv(G, policy.python_policy_to_pyspiel_policy(policy.tabular_policy_from_callable(G, armac.action_probabilities)))
       f.write(f'{iteration_} {conv}\n')
       f.flush()
