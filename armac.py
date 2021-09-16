@@ -80,11 +80,16 @@ def action_to_matrix(action, device):
 class ArmacNeuralNetwork(nn.Module):
   def __init__(self, information_state_size, num_distinct_actions, observation_generalization_size, hidden):
     super(ArmacNeuralNetwork, self).__init__()
+    # observation layers of all the heads
     self.observation1 = nn.Linear(information_state_size, observation_generalization_size)
     self.observation2 = nn.Linear(information_state_size, observation_generalization_size)
+    # first layer of history value head
     self.l1 = nn.Linear(observation_generalization_size * 2, hidden)
+    # first layer of accumulative regrets head and average policy head
     self.l2s = [nn.Linear(observation_generalization_size, hidden) for _ in range(2)]
+    # second layer of all three heads
     self.l3s = [nn.Linear(hidden, num_distinct_actions) for _ in range(3)]
+    # to store which device on
     self.dummy = nn.Parameter(T.empty(0))
 
   def get_history_values(self, full_history_state, legal_actions):
@@ -115,7 +120,7 @@ class ArmacNeuralNetwork(nn.Module):
     temp = F.relu(self.l3s[2](F.sigmoid(self.l2s[1](F.sigmoid(self.observation1(state))))))
     temp = T.gather(temp, 1, legal_actions)
     if temp.sum() == .0:
-      return T.ones(temp.size()) / len(legal_actions)
+      return temp  # won't create a uniform distribution vector, otherwise the gradient will miss
     else:
       return temp / temp.sum(1, keepdims=True)
 
@@ -127,7 +132,7 @@ class ArmacNeuralNetwork(nn.Module):
     with T.no_grad():
       temp = F.relu(self.get_accumulative_regrets(state, legal_actions)).to('cpu')
       if temp.sum() == .0:
-        return T.ones(temp.size()) / len(legal_actions)
+        return temp # won't create a uniform distribution vector, otherwise the gradient will miss
       else:
         return temp / temp.sum(1, keepdims=True)
 
@@ -278,6 +283,8 @@ class ArmacSolver(policy.Policy):
       legal_actions = state.legal_actions()
       strategy = actor_network.get_strategy_without_grad(information_state, legal_actions)
       probabilities = np.array(strategy).squeeze()
+      if probabilities.sum() == .0:
+        probabilities = np.ones(len(legal_actions)) / len(legal_actions)
       action = rn.choice(legal_actions, 1, p=probabilities)
       past_strategy = self._past_network.get_strategy_without_grad(information_state, legal_actions)
       full_history_state = [state.information_state_tensor(0), state.information_state_tensor(1)]
@@ -294,6 +301,8 @@ class ArmacSolver(policy.Policy):
     legal_actions = state.legal_actions()
     strategy = self._network.get_average_strategy_without_grad(state.information_state_tensor(state.current_player()), legal_actions)
     probabilities = np.array(strategy).squeeze()
+    if probabilities.sum() == .0:
+      probabilities = np.ones(len(legal_actions)) / len(legal_actions)
     return {legal_actions[i]: probabilities[i] for i in range(len(legal_actions))}
 
 
